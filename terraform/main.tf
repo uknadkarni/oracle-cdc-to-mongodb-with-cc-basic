@@ -1,12 +1,3 @@
-terraform {
-  required_providers {
-    confluent = {
-      source  = "confluentinc/confluent"
-      version = "1.34.0"
-    }
-  }
-}
-
 provider "confluent" {
   cloud_api_key    = var.confluent_cloud_api_key
   cloud_api_secret = var.confluent_cloud_api_secret
@@ -22,11 +13,11 @@ resource "confluent_environment" "staging" {
 resource "confluent_network" "aws-transit-gateway-attachment" {
   display_name     = "AWS Transit Gateway Attachment Network"
   cloud            = "AWS"
-  region           = "us-east-2"
+  region           = local.region
   cidr             = "10.10.0.0/16"
   connection_types = ["TRANSITGATEWAY"]
   environment {
-    id = confluent_environment.development.id
+    id = confluent_environment.staging.id
   }
 }
 
@@ -34,7 +25,7 @@ resource "confluent_network" "aws-transit-gateway-attachment" {
 # but you should to place both in the same cloud and region to restrict the fault isolation boundary.
 data "confluent_schema_registry_region" "essentials" {
   cloud   = "AWS"
-  region  = "us-east-2"
+  region  = local.region
   package = "ESSENTIALS"
 }
 
@@ -57,7 +48,7 @@ resource "confluent_kafka_cluster" "basic" {
   display_name = "inventory"
   availability = "SINGLE_ZONE"
   cloud        = "AWS"
-  region       = "us-east-2"
+  region       = local.region 
   basic {}
   environment {
     id = confluent_environment.staging.id
@@ -256,6 +247,75 @@ resource "confluent_kafka_acl" "app-connector-describe-on-cluster" {
   }
 }
 
+resource "confluent_kafka_acl" "app-connector-write-on-prefix-topics" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.basic.id
+  }
+  resource_type = "TOPIC"
+  resource_name = "${local.topic_prefix}"
+  pattern_type  = "PREFIXED"
+  principal     = "User:${confluent_service_account.app-connector.id}"
+  host          = "*"
+  operation     = "WRITE"
+  permission    = "ALLOW"
+  rest_endpoint = confluent_kafka_cluster.basic.rest_endpoint
+  credentials {
+    key    = confluent_api_key.app-manager-kafka-api-key.id
+    secret = confluent_api_key.app-manager-kafka-api-key.secret
+  }
+}
+resource "confluent_kafka_acl" "app-connector-create-on-data-preview-topics" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.basic.id
+  }
+  resource_type = "TOPIC"
+  resource_name = "data-preview.${local.oracle_database}.${local.oracle_collection}"
+  pattern_type  = "LITERAL"
+  principal     = "User:${confluent_service_account.app-connector.id}"
+  host          = "*"
+  operation     = "CREATE"
+  permission    = "ALLOW"
+  rest_endpoint = confluent_kafka_cluster.basic.rest_endpoint
+  credentials {
+    key    = confluent_api_key.app-manager-kafka-api-key.id
+    secret = confluent_api_key.app-manager-kafka-api-key.secret
+  }
+}
+
+resource "confluent_kafka_acl" "app-connector-write-on-data-preview-topics" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.basic.id
+  }
+  resource_type = "TOPIC"
+  resource_name = "data-preview.${local.oracle_database}.${local.oracle_collection}"
+  pattern_type  = "LITERAL"
+  principal     = "User:${confluent_service_account.app-connector.id}"
+  host          = "*"
+  operation     = "WRITE"
+  permission    = "ALLOW"
+  rest_endpoint = confluent_kafka_cluster.basic.rest_endpoint
+  credentials {
+    key    = confluent_api_key.app-manager-kafka-api-key.id
+    secret = confluent_api_key.app-manager-kafka-api-key.secret
+  }
+}
+resource "confluent_kafka_acl" "app-connector-create-on-prefix-topics" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.basic.id
+  }
+  resource_type = "TOPIC"
+  resource_name = "${local.topic_prefix}"
+  pattern_type  = "PREFIXED"
+  principal     = "User:${confluent_service_account.app-connector.id}"
+  host          = "*"
+  operation     = "CREATE"
+  permission    = "ALLOW"
+  rest_endpoint = confluent_kafka_cluster.basic.rest_endpoint
+  credentials {
+    key    = confluent_api_key.app-manager-kafka-api-key.id
+    secret = confluent_api_key.app-manager-kafka-api-key.secret
+  }
+}
 resource "confluent_kafka_acl" "app-connector-read-on-target-topic" {
   kafka_cluster {
     id = confluent_kafka_cluster.basic.id
@@ -443,5 +503,77 @@ resource "confluent_connector" "mongo-db-sink" {
     confluent_kafka_acl.app-connector-create-on-error-lcc-topics,
     confluent_kafka_acl.app-connector-write-on-error-lcc-topics,
     confluent_kafka_acl.app-connector-read-on-connect-lcc-group,
+  ]
+}
+
+
+resource "confluent_connector" "oracle-cdc-source" {
+  environment {
+    id = confluent_environment.staging.id
+  }
+  kafka_cluster {
+    id = confluent_kafka_cluster.basic.id
+  }
+
+  // Block for custom *sensitive* configuration properties that are labelled with "Type: password" under "Configuration Properties" section in the docs:
+  // https://docs.confluent.io/cloud/current/connectors/cc-mongo-db-source.html#configuration-properties
+  config_sensitive = {
+    "connection.password" = "***REDACTED***",
+  }
+
+  // Block for custom *nonsensitive* configuration properties that are *not* labelled with "Type: password" under "Configuration Properties" section in the docs:
+  // https://docs.confluent.io/cloud/current/connectors/cc-mongo-db-source.html#configuration-properties
+  config_nonsensitive = {
+    "connector.class" = "io.confluent.connect.oracle.cdc.OracleCdcSourceConnector"
+    "name" = "confluent-oracle-cdc"
+    "tasks.max" = "1"
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    #"key.converter.schema.registry.url": "http://localhost:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    #"value.converter.schema.registry.url": "http://localhost:8081",
+    #"confluent.topic.bootstrap.servers":"localhost:9092",
+    "oracle.server": local.oracle_server
+    "oracle.port": 1521,
+    "oracle.sid": local.oracle_sid
+    "oracle.pdb.name": local.oracle_pdb_name
+    "oracle.username": local.oracle_username
+    "oracle.password": local.oracle_password
+    "start.from":"snapshot"
+    "redo.log.topic.name": "redo-log-topic-1"
+    "table.inclusion.regex":"<regex-expression>"
+    #"_table.topic.name.template_":"Set to an empty string to disable generating change event records",
+    "_table.topic.name.template_":""
+    "table.topic.name.template": ""
+    "connection.pool.max.size": 20
+    "confluent.topic.replication.factor":1
+    "topic.creation.groups": "redo"
+    "topic.creation.redo.include": "redo-log-topic"
+    "topic.creation.redo.replication.factor": 3
+    "topic.creation.redo.partitions": 1
+    "topic.creation.redo.cleanup.policy": "delete"
+    "topic.creation.redo.retention.ms": 1209600000
+    "topic.creation.default.replication.factor": 3
+    "topic.creation.default.partitions": 5
+    "topic.creation.default.cleanup.policy": "compact"
+    
+    "kafka.auth.mode"          = "SERVICE_ACCOUNT"
+    "kafka.service.account.id" = confluent_service_account.app-connector.id
+    "connection.host" = local.oracle_connection_host
+    "connection.user" = local.oracle_connection_user
+    "topic.prefix" = local.topic_prefix
+    "database" = local.oracle_database
+    "collection" = local.oracle_collection
+    "poll.await.time.ms" = "5000"
+    "poll.max.batch.size" = "1000"
+    "copy.existing" = "true"
+    "output.data.format" = "JSON"
+  }
+
+  depends_on = [
+    confluent_kafka_acl.app-connector-describe-on-cluster,
+    confluent_kafka_acl.app-connector-create-on-prefix-topics,
+    confluent_kafka_acl.app-connector-write-on-prefix-topics,
+    confluent_kafka_acl.app-connector-create-on-data-preview-topics,
+    confluent_kafka_acl.app-connector-write-on-data-preview-topics,
   ]
 }
